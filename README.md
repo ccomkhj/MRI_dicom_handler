@@ -166,20 +166,6 @@ conda activate mri
 pip install -r requirements.txt
 ```
 
-### Dependencies
-- **pandas** - Data manipulation
-- **openpyxl** - Excel file reading
-- **pyarrow** - Parquet file format
-- **SimpleITK** - Medical image processing
-- **pydicom** - DICOM file reading
-- **highdicom** - DICOM SEG decoding
-- **pydicom-seg** - Segmentation support
-- **Pillow** - Image export (PNG/JPEG)
-- **numpy** - Numerical operations
-- **tqdm** - Progress bars
-
----
-
 ## 🔧 Configuration & Options
 
 ### DICOM Converter Options
@@ -223,19 +209,6 @@ converter.convert_all()
 
 ## 🔍 Features
 
-### DICOM Converter Features
-
-✅ **Automatic Series Discovery** - Finds all DICOM series in NBIA tree  
-✅ **Progress Bars** - Real-time progress tracking with tqdm  
-✅ **Batch Processing** - Process all classes in one command  
-✅ **Label Support** - Extracts DICOM SEG and NIfTI/NRRD masks  
-✅ **Multi-class Masks** - Handles multi-label segmentations  
-✅ **Geometry Matching** - Aligns labels to image grid  
-✅ **Intensity Normalization** - Auto windowing or manual control  
-✅ **Metadata Preservation** - Exports spacing, modality, dates  
-✅ **Robust Error Handling** - Continues on series failures  
-✅ **Combined Manifest** - Single CSV for all classes  
-
 ### Label/Mask Support
 
 The converter automatically detects and processes:
@@ -246,21 +219,6 @@ The converter automatically detects and processes:
 Masks are exported as binary PNGs (0/255) aligned to image slices.
 
 ---
-
-## 🐛 Troubleshooting
-
-### Issue: SSL Certificate Errors
-```bash
-# Use conda instead of pip
-conda install -c conda-forge simpleitk pydicom pillow tqdm
-pip install pydicom-seg highdicom
-```
-
-### Issue: No Series Found
-Check that NBIA downloads are in correct structure:
-```bash
-ls -R data/nbia/class1/
-```
 
 ### Issue: Segmentation Not Found
 - DICOM SEG requires `highdicom` package
@@ -277,46 +235,10 @@ python tools/dicom_converter.py --class 2
 
 ---
 
-## 📝 Notes
-
-### DICOM SEG Alignment
-- The converter uses **best-effort stacking** for DICOM SEG frames
-- For complex cases, consider exporting SEG → NIfTI in 3D Slicer first
-- RTSTRUCT is not supported (use Slicer to convert to segmentation)
-
-### MRI Intensity Windowing
-- Default: Auto percentile windowing (1st-99th percentile)
-- For CT: Set manual window, e.g., `window=(-200, 300)` for soft tissue
-
 ### Output Format
 - Images: 8-bit PNG (0-255), normalized via windowing
 - Masks: Binary PNG (0=background, 255=foreground)
 - Spacing preserved in manifest CSV for 3D reconstruction
-
----
-
-## 🎯 Next Steps
-
-After completing Step 4 (DICOM conversion):
-
-1. **Data Analysis**
-   - Review `manifest_all.csv` for dataset statistics
-   - Check label coverage across classes
-   - Visualize sample slices
-
-2. **Train/Val/Test Split**
-   - Stratify by class and patient
-   - Ensure no data leakage across patients
-
-3. **Deep Learning Pipeline**
-   - Load slices using `image_path` from manifest
-   - Apply augmentations (rotation, flip, elastic)
-   - Train CNN classifier or segmentation model
-
-4. **Model Training**
-   - Binary classification (cancer vs. non-cancer)
-   - Multi-class PIRADS prediction
-   - Segmentation with available masks
 
 ---
 
@@ -344,6 +266,3 @@ Per-Slice Images (data/processed/)
     ↓
 Deep Learning Pipeline
 ```
-
-**Status:** Ready for Step 3 (DICOM download) 🎯
-
