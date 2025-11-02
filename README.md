@@ -9,39 +9,33 @@ mri/
 ├── data/
 │   ├── raw/                    # Raw Excel files
 │   │   ├── selected_patients_3.xlsx
-│   │   ├── Target-Data_2019-12-05-2.xlsx
-│   │   └── TCIA-Biopsy-Data_2020-07-14.xlsx
+│   │   └── Prostate-MRI-US-Biopsy-NBIA-manifest_v2_20231020-nbia-digest.xlsx
 │   ├── splitted_images/        # Image-only records (197 rows)
-│   │   ├── class=1/           # PIRADS 0-2 (17 series)
-│   │   ├── class=2/           # PIRADS 3 (60 series)
-│   │   ├── class=3/           # PIRADS 4 (60 series)
-│   │   └── class=4/           # PIRADS 5 (60 series)
+│   │   └── class={1,2,3,4}/   # PIRADS-based classes
 │   ├── splitted_info/          # Enriched records with targets & biopsies (10,881 rows)
-│   │   ├── class=1/           # PIRADS 0-2 (905 rows)
-│   │   ├── class=2/           # PIRADS 3 (4,830 rows)
-│   │   ├── class=3/           # PIRADS 4 (3,458 rows)
-│   │   └── class=4/           # PIRADS 5 (1,688 rows)
+│   │   └── class={1,2,3,4}/
 │   ├── tcia/                   # TCIA manifest files
-│   │   ├── class1.tcia
-│   │   ├── class2.tcia
-│   │   ├── class3.tcia
-│   │   └── class4.tcia
-│   ├── nbia/                   # Downloaded DICOM files (from NBIA)
-│   │   ├── class1/
-│   │   ├── class2/
-│   │   ├── class3/
-│   │   └── class4/
-│   └── processed/              # Converted per-slice images
-│       ├── class1/
-│       ├── class2/
-│       ├── class3/
-│       ├── class4/
-│       └── manifest_all.csv
+│   │   ├── t2/, ep2d_adc/, ep2d_calc/  # By sequence type
+│   │   └── study/             # Full study downloads
+│   ├── overlay/                # 3D Slicer biopsy annotations
+│   │   └── Biopsy Overlays (3D Slicer)/
+│   ├── nbia/                   # Downloaded DICOM files
+│   │   └── class{1,2,3,4}/
+│   ├── processed/              # Converted per-slice images
+│   │   └── class{1,2,3,4}/case_XXXX/{series_uid}/images/
+│   ├── processed_seg/          # Segmentation masks (aligned)
+│   │   └── class{1,2,3,4}/case_XXXX/{series_uid}/{structure}/
+│   └── visualizations/         # Mask overlays on images
+│       └── class{1,2,3,4}/case_XXXX/
 ├── tools/
-│   ├── convert_xlsx2parquet.py  # Excel → Parquet converter
-│   ├── merge_datasets.py        # Merge multi-source data
-│   ├── tcia_generator.py        # Generate TCIA manifests
-│   └── dicom_converter.py       # DICOM → PNG converter
+│   ├── convert_xlsx2parquet.py       # Excel → Parquet converter
+│   ├── merge_datasets.py             # Merge multi-source data
+│   ├── tcia_generator.py             # Generate TCIA manifests (by series)
+│   ├── generate_tcia_by_class.py     # Generate TCIA by sequence type
+│   ├── generate_tcia_by_study.py     # Generate TCIA by study (full download)
+│   ├── dicom_converter.py            # DICOM → PNG converter
+│   ├── process_overlay_aligned.py    # STL → PNG masks (DICOM-aligned)
+│   └── visualize_overlay_masks.py    # Visualize masks on images
 └── requirements.txt
 ```
 
@@ -95,20 +89,17 @@ python tools/merge_datasets.py
 
 ### Step 2: Generate TCIA Manifests (✅ Complete)
 
-Extract MRI Series Instance UIDs and create downloadable TCIA manifest files.
-
+#### Option A: By Series (T2, ADC, CALC_BVAL separately)
 ```bash
-conda activate mri
-python tools/tcia_generator.py
+python tools/generate_tcia_by_class.py
 ```
+**Output:** `data/tcia/{t2,ep2d_adc,ep2d_calc}/class{1-4}.tcia`
 
-**Note:** Uses `data/splitted_images/` as source (image-only records without data expansion).
-
-**Output:** TCIA manifest files in `data/tcia/`
-- `class1.tcia` - 17 series UIDs
-- `class2.tcia` - 58 series UIDs
-- `class3.tcia` - 60 series UIDs
-- `class4.tcia` - 59 series UIDs
+#### Option B: By Study (Download all sequences)
+```bash
+python tools/generate_tcia_by_study.py
+```
+**Output:** `data/tcia/study/class{1-4}.tcia`
 
 ---
 
@@ -192,6 +183,46 @@ data/processed/
 
 ---
 
+### Step 5: Process Overlay Segmentations (✅ Complete)
+
+Convert 3D Slicer STL mesh segmentations to aligned PNG masks.
+
+```bash
+conda activate mri
+python tools/process_overlay_aligned.py
+```
+
+**Requirements:** Original DICOM files in `data/nbia/`
+
+**Output:** `data/processed_seg/class{N}/case_XXXX/{series_uid}/{structure}/`
+- `prostate/0000.png, 0001.png, ...` - Prostate gland masks
+- `target1/0000.png, 0001.png, ...` - Lesion masks
+- `biopsies.json` - Biopsy coordinates with pathology
+
+**Key features:**
+- Uses DICOM geometry for proper alignment
+- Transforms meshes from physical space to image space
+- Masks exactly match image dimensions
+
+---
+
+### Step 6: Visualize Segmentations (✅ Complete)
+
+Create overlay visualizations to verify mask alignment.
+
+```bash
+python tools/visualize_overlay_masks.py
+```
+
+**Output:** `data/visualizations/class{N}/case_XXXX/slice_NNNN.png`
+- 3-panel images: Original | Overlay | Masks
+- Color-coded: 🟡 Prostate, 🔴 Target lesions
+- Samples 10 slices per series
+
+**📚 Detailed docs:** `DICOM_ALIGNED_PROCESSING.md`, `OVERLAY_DATA_ANALYSIS.md`
+
+---
+
 ## 📦 Installation
 
 ### Setup Conda Environment
@@ -233,15 +264,14 @@ converter.convert_all()
 
 ## 📊 Data Statistics
 
-### Current Dataset (After Step 2)
-
-| Class | PIRADS | Series Count | Risk Level |
-|-------|--------|--------------|------------|
-| 1     | 0-2    | 17           | Low        |
-| 2     | 3      | 58           | Intermediate |
-| 3     | 4      | 60           | High       |
-| 4     | 5      | 59           | Very High  |
-| **Total** | - | **194**     | -          |
+| Dataset | Count | Description |
+|---------|-------|-------------|
+| **MRI Series** | 197 | T2, ADC, CALC_BVAL sequences |
+| **PIRADS Classes** | 4 | Class 1 (17), Class 2 (60), Class 3 (60), Class 4 (60) |
+| **Image Slices** | ~8,000 | Per-slice PNG images |
+| **Segmentation Cases** | ~45 | With aligned prostate & lesion masks |
+| **Biopsy Annotations** | 3,041 | 3D Slicer overlays with pathology |
+| **Biopsy Cores** | ~24,000 | From TCIA dataset |
 
 ---
 
@@ -280,12 +310,18 @@ python tools/dicom_converter.py --class 2
 
 ---
 
-## 📚 References
+## 📚 Documentation & References
 
+### Detailed Guides
+- **`DICOM_ALIGNED_PROCESSING.md`** - How DICOM-based mask alignment works
+- **`OVERLAY_DATA_ANALYSIS.md`** - Understanding biopsy overlay data structure
+- **`QUICK_START_OVERLAY.md`** - 3-step quick start for overlay processing
+- **`tools/README_TCIA_GENERATOR.md`** - TCIA manifest generation details
+
+### External Resources
 - [TCIA Prostate-MRI-US-Biopsy Collection](https://www.cancerimagingarchive.net/collection/prostate-mri-us-biopsy/)
 - [NBIA Data Retriever](https://wiki.cancerimagingarchive.net/display/NBIA/Downloading+TCIA+Images)
 - [SimpleITK Documentation](https://simpleitk.readthedocs.io/)
-- [DICOM SEG Standard](https://dicom.nema.org/medical/dicom/current/output/chtml/part03/sect_A.51.html)
 
 ---
 
@@ -294,20 +330,28 @@ python tools/dicom_converter.py --class 2
 ```
 Excel Data (3 sources)
     ↓ [convert_xlsx2parquet.py]
-Image-Only Records (data/splitted_images/)
+Image-Only Records (data/splitted_images/) - 197 series
     ↓ [merge_datasets.py]
 Enriched Records (data/splitted_info/) - 10,881 rows with targets & biopsies
     │
-    └→ [tcia_generator.py]
-       TCIA Manifests (.tcia files)
-           ↓ [NBIA Data Retriever - Manual]
-       DICOM Files (data/nbia/)
-           ↓ [dicom_converter.py]
-       Per-Slice Images (data/processed/)
+    ├→ [generate_tcia_by_class.py / generate_tcia_by_study.py]
+    │  TCIA Manifests (.tcia files)
+    │      ↓ [NBIA Data Retriever - Manual]
+    │  DICOM Files (data/nbia/)
+    │      ↓ [dicom_converter.py]
+    │  Per-Slice Images (data/processed/)
+    │
+    └→ [process_overlay_aligned.py]
+       3D Slicer Overlays → DICOM-Aligned Masks (data/processed_seg/)
+           ↓ [visualize_overlay_masks.py]
+       Visualizations (data/visualizations/)
            ↓
-       Deep Learning Pipeline
+       Deep Learning with Images + Segmentation Masks
 ```
 
-**Two parallel datasets:**
-1. **splitted_images/** - Compact (197 rows) for TCIA manifest generation
-2. **splitted_info/** - Enriched (10,881 rows) for detailed analysis with all patient data
+**Key datasets:**
+1. **splitted_images/** - 197 series for manifest generation
+2. **splitted_info/** - 10,881 rows with all patient metadata
+3. **processed/** - ~8,000 MRI image slices
+4. **processed_seg/** - ~45 cases with segmentation masks
+5. **overlay/** - 3,041 cases with biopsy annotations

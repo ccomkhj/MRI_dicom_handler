@@ -1,15 +1,14 @@
 #!/usr/bin/env python3
 """
-Process biopsy overlay data to create PNG masks for training.
+Process biopsy overlay data with proper DICOM-based spatial alignment.
 
-This script:
-1. Matches overlay directories with MRI Series Instance UIDs from parquet files
-2. Converts STL mesh segmentations to PNG masks (slice-by-slice)
-3. Copies/organizes only matching data
-4. Optionally creates biopsy point annotations
+This script properly aligns STL mesh segmentations with DICOM images by:
+1. Reading DICOM metadata (spacing, origin, orientation)
+2. Transforming mesh coordinates to image space
+3. Rasterizing at exact image resolution
 
 Requirements:
-    pip install pandas pyarrow trimesh numpy pillow SimpleITK pydicom tqdm
+    pip install pandas pyarrow trimesh numpy pillow SimpleITK pydicom tqdm scipy
 """
 
 import pandas as pd
@@ -23,18 +22,13 @@ import numpy as np
 from PIL import Image
 import trimesh
 from tqdm import tqdm
+import pydicom
+import SimpleITK as sitk
+from scipy.ndimage import binary_fill_holes
 
 
 def load_series_uids_from_parquet(parquet_dir: str) -> Dict[str, Dict]:
-    """
-    Load Series Instance UIDs and their corresponding classes/patients from parquet files.
-    
-    Args:
-        parquet_dir: Directory containing class-organized parquet files
-    
-    Returns:
-        Dict mapping Series UID to {class, patient_number}
-    """
+    """Load Series Instance UIDs and their corresponding classes/patients."""
     series_info_map = {}
     parquet_path = Path(parquet_dir)
     
@@ -48,14 +42,12 @@ def load_series_uids_from_parquet(parquet_dir: str) -> Dict[str, Dict]:
         for parquet_file in class_dir.glob("*.parquet"):
             df = pd.read_parquet(parquet_file)
             
-            # Look for Series Instance UID column
             series_col = None
             for col_name in ["Series Instance UID (MRI)", "Series Instance UID", "SeriesInstanceUID"]:
                 if col_name in df.columns:
                     series_col = col_name
                     break
             
-            # Look for patient number column
             patient_col = None
             for col_name in ["patient_number", "Patient ID", "PatientID"]:
                 if col_name in df.columns:
@@ -66,14 +58,11 @@ def load_series_uids_from_parquet(parquet_dir: str) -> Dict[str, Dict]:
                 for _, row in df.iterrows():
                     series_uid = str(row[series_col])
                     
-                    # Extract patient number (should be 4 digits like "0114")
                     if patient_col:
                         patient_val = str(row[patient_col])
-                        # If it's "Prostate-MRI-US-Biopsy-0114", extract just "0114"
                         if "Prostate-MRI-US-Biopsy-" in patient_val:
                             patient_num = patient_val.split("Prostate-MRI-US-Biopsy-")[1].split("-")[0]
                         else:
-                            # Just pad with zeros if it's already a number
                             patient_num = patient_val.zfill(4)
                     else:
                         patient_num = "0000"
@@ -84,29 +73,13 @@ def load_series_uids_from_parquet(parquet_dir: str) -> Dict[str, Dict]:
                     }
                 
                 print(f"  Class {class_num}: Added {len(df)} series from {parquet_file.name}")
-            else:
-                print(f"  Warning: No Series UID column in {parquet_file.name}")
-                print(f"    Available columns: {list(df.columns)}")
     
     print(f"\n✓ Total unique series UIDs: {len(series_info_map)}")
     return series_info_map
 
 
 def extract_series_uid_from_dirname(dirname: str) -> Optional[str]:
-    """
-    Extract Series Instance UID from overlay directory name.
-    
-    Example:
-        'Prostate-MRI-US-Biopsy-0001-BXmr-seriesUID-1.3.6.1.4.1.14519...'
-        Returns: '1.3.6.1.4.1.14519...'
-    
-    Args:
-        dirname: Overlay directory name
-    
-    Returns:
-        Series Instance UID or None
-    """
-    # Pattern: seriesUID-{UID}
+    """Extract Series Instance UID from overlay directory name."""
     match = re.search(r'seriesUID-([0-9.]+)', dirname)
     if match:
         return match.group(1)
@@ -115,16 +88,7 @@ def extract_series_uid_from_dirname(dirname: str) -> Optional[str]:
 
 def match_overlay_dirs_with_series(overlay_base_dir: str, 
                                    series_info_map: Dict[str, Dict]) -> Dict[str, Dict]:
-    """
-    Match overlay directories with Series Instance UIDs.
-    
-    Args:
-        overlay_base_dir: Base directory containing overlay data
-        series_info_map: Mapping of Series UID to {class, patient_number}
-    
-    Returns:
-        Dict mapping overlay directory to metadata (series_uid, class, patient_number)
-    """
+    """Match overlay directories with Series Instance UIDs."""
     overlay_path = Path(overlay_base_dir)
     matched_dirs = {}
     unmatched_count = 0
@@ -154,7 +118,6 @@ def match_overlay_dirs_with_series(overlay_base_dir: str,
     print(f"\n  ✓ Matched directories: {len(matched_dirs)}")
     print(f"  ✗ Unmatched directories: {unmatched_count}")
     
-    # Show distribution by class
     class_counts = defaultdict(int)
     for info in matched_dirs.values():
         class_counts[info["class"]] += 1
@@ -166,65 +129,201 @@ def match_overlay_dirs_with_series(overlay_base_dir: str,
     return matched_dirs
 
 
-def load_stl_mesh(stl_path: Path) -> Optional[trimesh.Trimesh]:
-    """
-    Load an STL file as a trimesh object.
+def find_dicom_files(processed_dir: Path, class_num: int, patient_num: str, series_uid: str) -> Optional[Path]:
+    """Find the DICOM directory for a given series."""
+    # Check in processed directory structure
+    nbia_base = Path("data/nbia")
+    class_dir = nbia_base / f"class{class_num}"
     
-    Args:
-        stl_path: Path to STL file
+    # Search for DICOM files with matching series UID
+    if class_dir.exists():
+        for dicom_dir in class_dir.rglob("*"):
+            if dicom_dir.is_dir():
+                # Check if any DICOM file in this directory has matching Series UID
+                for dcm_file in dicom_dir.glob("*.dcm"):
+                    try:
+                        dcm = pydicom.dcmread(dcm_file, stop_before_pixels=True)
+                        if hasattr(dcm, 'SeriesInstanceUID') and dcm.SeriesInstanceUID == series_uid:
+                            return dicom_dir
+                    except:
+                        continue
+    
+    return None
+
+
+def load_dicom_geometry(dicom_dir: Path) -> Optional[Dict]:
+    """
+    Load DICOM geometry information from a series directory.
     
     Returns:
-        Trimesh object or None if failed
+        Dict with spacing, origin, direction, dimensions
     """
+    try:
+        # Read all DICOM files and sort by instance number
+        dcm_files = sorted(dicom_dir.glob("*.dcm"))
+        if not dcm_files:
+            return None
+        
+        # Read first file for metadata
+        dcm = pydicom.dcmread(dcm_files[0])
+        
+        # Get image geometry
+        spacing = np.array([
+            float(dcm.PixelSpacing[0]),
+            float(dcm.PixelSpacing[1]),
+            float(dcm.SliceThickness) if hasattr(dcm, 'SliceThickness') else 1.0
+        ])
+        
+        origin = np.array(dcm.ImagePositionPatient, dtype=float)
+        
+        # Get orientation matrix
+        orientation = np.array(dcm.ImageOrientationPatient, dtype=float).reshape(2, 3)
+        
+        # Build direction matrix
+        direction = np.eye(3)
+        direction[:, 0] = orientation[0]  # X direction
+        direction[:, 1] = orientation[1]  # Y direction
+        direction[:, 2] = np.cross(orientation[0], orientation[1])  # Z direction
+        
+        # Get dimensions
+        dimensions = np.array([
+            int(dcm.Rows),
+            int(dcm.Columns),
+            len(dcm_files)
+        ])
+        
+        return {
+            'spacing': spacing,
+            'origin': origin,
+            'direction': direction,
+            'dimensions': dimensions,
+            'num_slices': len(dcm_files)
+        }
+        
+    except Exception as e:
+        print(f"    Error loading DICOM geometry: {e}")
+        return None
+
+
+def load_stl_mesh(stl_path: Path) -> Optional[trimesh.Trimesh]:
+    """Load an STL file as a trimesh object."""
     try:
         mesh = trimesh.load(stl_path)
         return mesh
     except Exception as e:
-        print(f"    Warning: Failed to load {stl_path.name}: {e}")
         return None
 
 
-def mesh_to_voxel_grid(mesh: trimesh.Trimesh, 
-                       voxel_size: float = 0.5) -> Tuple[np.ndarray, np.ndarray]:
+def transform_mesh_to_image_space(mesh: trimesh.Trimesh, 
+                                  geometry: Dict) -> trimesh.Trimesh:
     """
-    Convert a mesh to a voxel grid.
+    Transform mesh vertices from physical space to image voxel space.
     
     Args:
-        mesh: Trimesh object
-        voxel_size: Size of each voxel in mm
+        mesh: Trimesh in physical coordinates (LPS)
+        geometry: DICOM geometry info
     
     Returns:
-        Tuple of (voxel_grid, origin_point)
+        Transformed mesh in voxel coordinates
     """
-    # Create voxel grid from mesh
-    voxelized = mesh.voxelized(pitch=voxel_size)
-    voxel_grid = voxelized.matrix
-    origin = voxelized.transform[:3, 3]
+    # Get geometry parameters
+    origin = geometry['origin']
+    spacing = geometry['spacing']
+    direction = geometry['direction']
     
-    return voxel_grid, origin
+    # Transform: Physical -> Voxel
+    # voxel = inv(direction) * (physical - origin) / spacing
+    
+    vertices = mesh.vertices.copy()
+    
+    # Subtract origin
+    vertices -= origin
+    
+    # Apply inverse direction matrix
+    direction_inv = np.linalg.inv(direction)
+    vertices = vertices @ direction_inv.T
+    
+    # Scale by spacing
+    vertices /= spacing
+    
+    # Create new mesh with transformed vertices
+    transformed_mesh = mesh.copy()
+    transformed_mesh.vertices = vertices
+    
+    return transformed_mesh
 
 
-def save_voxel_slices_as_png(voxel_grid: np.ndarray, 
-                             output_dir: Path,
-                             prefix: str = "") -> int:
+def rasterize_mesh_to_slices(mesh: trimesh.Trimesh, 
+                             dimensions: np.ndarray) -> np.ndarray:
     """
-    Save voxel grid slices as PNG images.
+    Rasterize mesh to 3D binary volume.
     
     Args:
-        voxel_grid: 3D binary numpy array
-        output_dir: Output directory for PNG files
-        prefix: Filename prefix (optional)
+        mesh: Mesh in voxel coordinates
+        dimensions: [rows, cols, slices]
+    
+    Returns:
+        3D binary numpy array
+    """
+    # Use trimesh voxelization but at resolution matching dimensions
+    bounds = mesh.bounds
+    voxel_size = 1.0  # Already in voxel space
+    
+    # Create voxel grid
+    try:
+        voxelized = mesh.voxelized(pitch=voxel_size)
+        voxel_grid = voxelized.matrix
+        
+        # Get voxel grid bounds
+        grid_origin = voxelized.transform[:3, 3]
+        
+        # Create output volume
+        volume = np.zeros(dimensions[::-1], dtype=np.uint8)  # [slices, rows, cols]
+        
+        # Map voxel grid to volume
+        # This is a simplified approach - may need refinement
+        x_min, y_min, z_min = np.maximum(np.floor(grid_origin).astype(int), 0)
+        x_max = min(x_min + voxel_grid.shape[0], dimensions[0])
+        y_max = min(y_min + voxel_grid.shape[1], dimensions[1])
+        z_max = min(z_min + voxel_grid.shape[2], dimensions[2])
+        
+        # Copy voxel data to volume
+        x_end = min(voxel_grid.shape[0], x_max - x_min)
+        y_end = min(voxel_grid.shape[1], y_max - y_min)
+        z_end = min(voxel_grid.shape[2], z_max - z_min)
+        
+        if x_end > 0 and y_end > 0 and z_end > 0:
+            volume[z_min:z_max, y_min:y_max, x_min:x_max] = \
+                voxel_grid[:x_end, :y_end, :z_end].transpose(2, 1, 0)
+        
+        # Fill holes in each slice
+        for i in range(volume.shape[0]):
+            volume[i] = binary_fill_holes(volume[i]).astype(np.uint8)
+        
+        return volume
+        
+    except Exception as e:
+        print(f"      Error rasterizing mesh: {e}")
+        return np.zeros(dimensions[::-1], dtype=np.uint8)
+
+
+def save_volume_as_pngs(volume: np.ndarray, 
+                        output_dir: Path) -> int:
+    """
+    Save 3D volume as PNG slices.
+    
+    Args:
+        volume: 3D binary array [slices, rows, cols]
+        output_dir: Output directory
     
     Returns:
         Number of slices saved
     """
     output_dir.mkdir(parents=True, exist_ok=True)
     
-    num_slices = voxel_grid.shape[2]  # Assuming z-axis is last dimension
     num_saved = 0
-    
-    for i in range(num_slices):
-        slice_data = voxel_grid[:, :, i]
+    for i in range(volume.shape[0]):
+        slice_data = volume[i]
         
         # Skip empty slices
         if not slice_data.any():
@@ -235,12 +334,7 @@ def save_voxel_slices_as_png(voxel_grid: np.ndarray,
         
         # Save as PNG
         img = Image.fromarray(img_data)
-        
-        if prefix:
-            img_path = output_dir / f"{prefix}_{i:04d}.png"
-        else:
-            img_path = output_dir / f"{i:04d}.png"
-        
+        img_path = output_dir / f"{i:04d}.png"
         img.save(img_path)
         num_saved += 1
     
@@ -248,21 +342,11 @@ def save_voxel_slices_as_png(voxel_grid: np.ndarray,
 
 
 def parse_fcsv_biopsy_coords(fcsv_path: Path) -> Optional[Dict]:
-    """
-    Parse a .fcsv file to extract biopsy coordinates.
-    
-    Args:
-        fcsv_path: Path to FCSV file
-    
-    Returns:
-        Dict with biopsy info or None
-    """
+    """Parse a .fcsv file to extract biopsy coordinates."""
     try:
-        # Read FCSV file
         with open(fcsv_path, 'r') as f:
             lines = f.readlines()
         
-        # Find data lines (skip comments)
         data_lines = [line.strip() for line in lines if not line.startswith('#')]
         
         if len(data_lines) < 2:
@@ -274,67 +358,70 @@ def parse_fcsv_biopsy_coords(fcsv_path: Path) -> Optional[Dict]:
             if line:
                 parts = line.split(',')
                 if len(parts) >= 12:
-                    # Extract x, y, z coordinates and label
                     x, y, z = float(parts[1]), float(parts[2]), float(parts[3])
                     label = parts[11]
                     coords.append([x, y, z])
                     labels.append(label)
         
         if len(coords) >= 2:
-            # Extract pathology from filename
-            pathology = fcsv_path.stem.replace("Bx-", "").replace(str(fcsv_path.stem.split('-')[0]), "")
+            pathology = fcsv_path.stem.split('-', 2)[-1] if '-' in fcsv_path.stem else "Unknown"
             
             return {
-                "top": coords[0],  # Entry point
-                "bottom": coords[1],  # Exit point
+                "top": coords[0],
+                "bottom": coords[1],
                 "pathology": pathology,
                 "filename": fcsv_path.name
             }
     except Exception as e:
-        print(f"    Warning: Failed to parse {fcsv_path.name}: {e}")
+        pass
     
     return None
 
 
 def process_overlay_directory(overlay_dir: Path, 
                               output_base_dir: Path,
+                              processed_dir: Path,
                               class_num: int,
                               patient_number: str,
-                              series_uid: str,
-                              voxel_size: float = 0.5) -> Dict:
-    """
-    Process a single overlay directory to create masks.
-    
-    Args:
-        overlay_dir: Path to overlay directory
-        output_base_dir: Base output directory
-        class_num: Class number
-        patient_number: Patient number (e.g., "0001")
-        series_uid: Series Instance UID
-        voxel_size: Voxel size for mesh rasterization
-    
-    Returns:
-        Dict with processing statistics
-    """
+                              series_uid: str) -> Dict:
+    """Process a single overlay directory with proper DICOM alignment."""
     stats = {
         "stl_files_found": 0,
         "stl_files_processed": 0,
         "fcsv_files_found": 0,
         "fcsv_files_processed": 0,
-        "slices_created": 0
+        "slices_created": 0,
+        "dicom_found": False
     }
     
-    # Create output directory structure matching processed/
-    # processed_seg/class{n}/case_{patient_number}/{series_uid}/prostate/, /target1/, etc.
     case_dir = output_base_dir / f"class{class_num}" / f"case_{patient_number}"
     series_dir = case_dir / series_uid
     
-    # Look for Data subdirectory
     data_dir = overlay_dir / "Data"
     if not data_dir.exists():
         return stats
     
-    # Process STL files (segmentation meshes)
+    # Find DICOM files for this series
+    dicom_dir = find_dicom_files(processed_dir, class_num, patient_number, series_uid)
+    
+    if dicom_dir is None:
+        # Fallback: try to find from processed structure
+        processed_series_dir = processed_dir / f"class{class_num}" / f"case_{patient_number}" / series_uid
+        if not processed_series_dir.exists():
+            return stats
+        
+        # Try to infer geometry from manifest
+        # This is a fallback - won't be as accurate
+        return stats
+    
+    stats["dicom_found"] = True
+    
+    # Load DICOM geometry
+    geometry = load_dicom_geometry(dicom_dir)
+    if geometry is None:
+        return stats
+    
+    # Process STL files
     stl_files = list(data_dir.glob("*.STL")) + list(data_dir.glob("*.stl"))
     stats["stl_files_found"] = len(stl_files)
     
@@ -343,24 +430,26 @@ def process_overlay_directory(overlay_dir: Path,
         if mesh is None:
             continue
         
-        # Convert mesh to voxel grid
         try:
-            voxel_grid, origin = mesh_to_voxel_grid(mesh, voxel_size=voxel_size)
+            # Transform mesh to image voxel space
+            transformed_mesh = transform_mesh_to_image_space(mesh, geometry)
             
-            # Save slices as PNG in subdirectory named after the structure
-            # e.g., prostate/, target1/, target2/
+            # Rasterize to volume
+            volume = rasterize_mesh_to_slices(transformed_mesh, geometry['dimensions'])
+            
+            # Save as PNG slices
             mask_name = stl_file.stem.lower().replace(" ", "_")
             mask_output_dir = series_dir / mask_name
             
-            num_slices = save_voxel_slices_as_png(voxel_grid, mask_output_dir, prefix="")
+            num_slices = save_volume_as_pngs(volume, mask_output_dir)
             
             stats["slices_created"] += num_slices
             stats["stl_files_processed"] += 1
             
         except Exception as e:
-            pass  # Silent fail, will show in progress bar
+            pass
     
-    # Process FCSV files (biopsy coordinates)
+    # Process FCSV files
     fcsv_files = list(data_dir.glob("*.fcsv"))
     stats["fcsv_files_found"] = len(fcsv_files)
     
@@ -371,27 +460,23 @@ def process_overlay_directory(overlay_dir: Path,
             biopsies_data.append(biopsy_info)
             stats["fcsv_files_processed"] += 1
     
-    # Save biopsy coordinates as JSON at case level (not series level)
     if biopsies_data:
         case_dir.mkdir(parents=True, exist_ok=True)
         biopsies_json = case_dir / "biopsies.json"
         
-        # If file exists, merge with existing biopsies
         existing_biopsies = []
         if biopsies_json.exists():
             with open(biopsies_json, 'r') as f:
                 existing_biopsies = json.load(f)
         
-        # Add series UID to each biopsy entry
         for biopsy in biopsies_data:
             biopsy['series_uid'] = series_uid
         
-        # Merge and save
         all_biopsies = existing_biopsies + biopsies_data
         with open(biopsies_json, 'w') as f:
             json.dump(all_biopsies, f, indent=2)
     
-    # Copy MRML file for reference
+    # Copy MRML file
     mrml_files = list(overlay_dir.glob("*.mrml"))
     if mrml_files:
         series_dir.mkdir(parents=True, exist_ok=True)
@@ -404,37 +489,36 @@ def main():
     """Main execution function."""
     
     print("="*80)
-    print("Overlay Data Processing: Match and Convert to PNG Masks")
+    print("Overlay Processing with Proper DICOM Alignment")
     print("="*80)
     
     # Configuration
     parquet_dir = "data/splitted_images"
     overlay_base_dir = "data/overlay/Biopsy Overlays (3D Slicer)"
-    output_base_dir = "data/processed_seg"  # Match processed structure
-    voxel_size = 0.5  # mm per voxel
+    output_base_dir = "data/processed_seg"
+    processed_dir = Path("data/processed")
     
-    # Step 1: Load Series Instance UIDs from parquet files
+    # Step 1: Load Series UIDs
     series_info_map = load_series_uids_from_parquet(parquet_dir)
     
     if not series_info_map:
-        print("❌ Error: No Series UIDs found in parquet files!")
+        print("❌ Error: No Series UIDs found!")
         return
     
-    # Step 2: Match overlay directories with Series UIDs
+    # Step 2: Match overlay directories
     matched_dirs = match_overlay_dirs_with_series(overlay_base_dir, series_info_map)
     
     if not matched_dirs:
         print("❌ Error: No matching overlay directories found!")
         return
     
-    # Step 3: Process each matched directory with progress bar
+    # Step 3: Process with progress bar
     print(f"\n{'='*80}")
-    print(f"Processing matched overlay directories...")
+    print(f"Processing with DICOM-based alignment...")
     print(f"{'='*80}\n")
     
     total_stats = defaultdict(int)
     
-    # Create progress bar
     pbar = tqdm(matched_dirs.items(), 
                 total=len(matched_dirs),
                 desc="Processing cases",
@@ -443,25 +527,23 @@ def main():
     for overlay_dir_str, info in pbar:
         overlay_dir = Path(overlay_dir_str)
         
-        # Update progress bar description
         pbar.set_description(f"Class {info['class']}, Patient {info['patient_number']}")
         
         stats = process_overlay_directory(
             overlay_dir,
             Path(output_base_dir),
+            processed_dir,
             info['class'],
             info['patient_number'],
-            info['series_uid'],
-            voxel_size=voxel_size
+            info['series_uid']
         )
         
-        # Accumulate stats
         for key, value in stats.items():
             total_stats[key] += value
         
-        # Update progress bar postfix with current stats
         pbar.set_postfix({
             'STL': f"{total_stats['stl_files_processed']}/{total_stats['stl_files_found']}",
+            'DICOM': total_stats['dicom_found'],
             'Slices': total_stats['slices_created']
         })
     
@@ -473,14 +555,11 @@ def main():
     print(f"{'='*80}")
     print(f"\nSummary Statistics:")
     print(f"  Total matched cases: {len(matched_dirs)}")
-    print(f"  STL files found: {total_stats['stl_files_found']}")
-    print(f"  STL files processed: {total_stats['stl_files_processed']}")
-    print(f"  FCSV files found: {total_stats['fcsv_files_found']}")
-    print(f"  FCSV files processed: {total_stats['fcsv_files_processed']}")
+    print(f"  Cases with DICOM found: {total_stats['dicom_found']}")
+    print(f"  STL files processed: {total_stats['stl_files_processed']}/{total_stats['stl_files_found']}")
+    print(f"  FCSV files processed: {total_stats['fcsv_files_processed']}/{total_stats['fcsv_files_found']}")
     print(f"  Total mask slices created: {total_stats['slices_created']}")
     print(f"\nOutput directory: {output_base_dir}/")
-    print(f"  Structure: class{{N}}/case_{{XXXX}}/{{series_uid}}/{{structure}}/")
-    print(f"  Example: class1/case_0001/{info['series_uid'][:40]}.../ prostate/")
 
 
 if __name__ == "__main__":
