@@ -116,7 +116,7 @@ def main():
     print("=" * 70)
 
     # Configuration
-    base_dir = "data/splitted"
+    base_dir = "data/splitted_images"
     output_dir = "data/tcia"
 
     # Process each class (1-4)
