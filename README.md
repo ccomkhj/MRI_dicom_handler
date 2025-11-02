@@ -8,12 +8,19 @@ Automated pipeline for processing MRI DICOM data from TCIA/NBIA for deep learnin
 mri/
 ├── data/
 │   ├── raw/                    # Raw Excel files
-│   │   └── selected_patients_3.xlsx
-│   ├── splitted/               # Class-partitioned parquet files
+│   │   ├── selected_patients_3.xlsx
+│   │   ├── Target-Data_2019-12-05-2.xlsx
+│   │   └── TCIA-Biopsy-Data_2020-07-14.xlsx
+│   ├── splitted_images/        # Image-only records (197 rows)
 │   │   ├── class=1/           # PIRADS 0-2 (17 series)
-│   │   ├── class=2/           # PIRADS 3 (58 series)
+│   │   ├── class=2/           # PIRADS 3 (60 series)
 │   │   ├── class=3/           # PIRADS 4 (60 series)
-│   │   └── class=4/           # PIRADS 5 (59 series)
+│   │   └── class=4/           # PIRADS 5 (60 series)
+│   ├── splitted_info/          # Enriched records with targets & biopsies (10,881 rows)
+│   │   ├── class=1/           # PIRADS 0-2 (905 rows)
+│   │   ├── class=2/           # PIRADS 3 (4,830 rows)
+│   │   ├── class=3/           # PIRADS 4 (3,458 rows)
+│   │   └── class=4/           # PIRADS 5 (1,688 rows)
 │   ├── tcia/                   # TCIA manifest files
 │   │   ├── class1.tcia
 │   │   ├── class2.tcia
@@ -32,6 +39,7 @@ mri/
 │       └── manifest_all.csv
 ├── tools/
 │   ├── convert_xlsx2parquet.py  # Excel → Parquet converter
+│   ├── merge_datasets.py        # Merge multi-source data
 │   ├── tcia_generator.py        # Generate TCIA manifests
 │   └── dicom_converter.py       # DICOM → PNG converter
 └── requirements.txt
@@ -48,12 +56,40 @@ conda activate mri
 python tools/convert_xlsx2parquet.py
 ```
 
-**Output:** Class-partitioned parquet files in `data/splitted/class={1,2,3,4}/`
+**Output:** Class-partitioned parquet files in `data/splitted_images/class={1,2,3,4}/`
 
 - **Class 1:** PIRADS 0, 1, 2 (combined) - Low risk
 - **Class 2:** PIRADS 3 - Intermediate risk
 - **Class 3:** PIRADS 4 - High risk
 - **Class 4:** PIRADS 5 - Very high risk
+
+---
+
+### Step 1b: Merge Multi-Source Data (✅ Complete)
+
+Enrich patient records by merging three data sources: image metadata, target lesions, and biopsy results.
+
+```bash
+conda activate mri
+python tools/merge_datasets.py
+```
+
+**Input sources:**
+- `data/raw/selected_patients_3.xlsx` - MRI image metadata (197 records)
+- `data/raw/Target-Data_2019-12-05-2.xlsx` - Target lesion data (1,617 targets from 840 patients)
+- `data/raw/TCIA-Biopsy-Data_2020-07-14.xlsx` - Biopsy core data (24,783 cores from 1,150 patients)
+
+**Output:** Enriched dataset in `data/splitted_info/` with:
+- **10,881 total rows** (55.23x multiplication from 197 original)
+- **48 total columns** (17 original + 5 target + 24 biopsy + 2 source tracking)
+- Multiple rows per patient due to one-to-many relationships
+- All 197 patients preserved with full data coverage
+
+**Key features:**
+- Left join preserves all image records
+- Handles multiple targets per patient
+- Handles multiple biopsy cores per patient
+- Prefixed columns (`target_*`, `biopsy_*`) to avoid conflicts
 
 ---
 
@@ -65,6 +101,8 @@ Extract MRI Series Instance UIDs and create downloadable TCIA manifest files.
 conda activate mri
 python tools/tcia_generator.py
 ```
+
+**Note:** Uses `data/splitted_images/` as source (image-only records without data expansion).
 
 **Output:** TCIA manifest files in `data/tcia/`
 - `class1.tcia` - 17 series UIDs
@@ -254,15 +292,22 @@ python tools/dicom_converter.py --class 2
 ## 👥 Workflow Summary
 
 ```
-Excel Data
+Excel Data (3 sources)
     ↓ [convert_xlsx2parquet.py]
-Parquet Files (class-partitioned)
-    ↓ [tcia_generator.py]
-TCIA Manifests (.tcia files)
-    ↓ [NBIA Data Retriever - Manual]
-DICOM Files (data/nbia/)
-    ↓ [dicom_converter.py]
-Per-Slice Images (data/processed/)
-    ↓
-Deep Learning Pipeline
+Image-Only Records (data/splitted_images/)
+    ↓ [merge_datasets.py]
+Enriched Records (data/splitted_info/) - 10,881 rows with targets & biopsies
+    │
+    └→ [tcia_generator.py]
+       TCIA Manifests (.tcia files)
+           ↓ [NBIA Data Retriever - Manual]
+       DICOM Files (data/nbia/)
+           ↓ [dicom_converter.py]
+       Per-Slice Images (data/processed/)
+           ↓
+       Deep Learning Pipeline
 ```
+
+**Two parallel datasets:**
+1. **splitted_images/** - Compact (197 rows) for TCIA manifest generation
+2. **splitted_info/** - Enriched (10,881 rows) for detailed analysis with all patient data
